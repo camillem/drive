@@ -11,6 +11,7 @@ and this project adheres to
 ### Added
 
 - ✨(frontend) set an expiration date on item share links
+- ✨(backend) import user storage limits from a CSV file in the admin
 
 ## [v0.27.0] - 2026-11-09
 

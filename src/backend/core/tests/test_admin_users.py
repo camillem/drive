@@ -6,6 +6,7 @@ from unittest import mock
 
 from django.conf import settings
 from django.contrib import admin
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import RequestFactory, override_settings
 from django.utils import timezone
 
@@ -432,3 +433,104 @@ def test_admin_users_deactivate_duplicates():
     assert set(models.User.objects.filter(is_active=True)) == set(kept)
     assert set(models.User.objects.filter(is_active=False)) == set(deactivated)
     message_user.assert_called_once_with(request, "3 users deactivated.")
+
+
+def _import_storage_limits(client, content):
+    """Post a CSV file to the storage limits import view."""
+    return client.post(
+        "/admin/core/user/import-storage-limits/",
+        {"file": SimpleUploadedFile("limits.csv", content)},
+    )
+
+
+@override_settings(STORAGES=STATIC_STORAGES)
+def test_admin_users_import_storage_limits_link(client):
+    """The users list should link to the storage limits import."""
+    response = _admin_client(client).get("/admin/core/user/")
+
+    assert response.status_code == 200
+    assert 'href="/admin/core/user/import-storage-limits/"' in response.content.decode()
+
+
+@override_settings(STORAGES=STATIC_STORAGES)
+def test_admin_users_import_storage_limits(client):
+    """The import should set the override of every user sharing a listed email."""
+    unlimited = factories.UserFactory(email="unlimited@example.com")
+    duplicate = factories.UserFactory(email="unlimited@example.com", storage_limit_override=1000)
+    limited = factories.UserFactory(email="limited@example.com", storage_limit_override=0)
+    default = factories.UserFactory(email="default@example.com", storage_limit_override=1000)
+    unchanged = factories.UserFactory(email="unchanged@example.com", storage_limit_override=0)
+    untouched = factories.UserFactory(email="untouched@example.com", storage_limit_override=1000)
+
+    response = _import_storage_limits(
+        _admin_client(client),
+        b"email,quota\n"
+        b"UNLIMITED@example.com,0\n"
+        b"limited@example.com,0.5\n"
+        b"default@example.com,\n"
+        b"unchanged@example.com,0\n"
+        b"missing@example.com,0\n",
+    )
+
+    assert response.status_code == 200
+    assert [
+        (result["email"], result.get("user"), result["status"])
+        for result in response.context["results"]
+    ] == [
+        ("unlimited@example.com", unlimited, "default limit → unlimited"),
+        ("unlimited@example.com", duplicate, "1.00 KB → unlimited"),
+        ("limited@example.com", limited, "unlimited → 500 MB"),
+        ("default@example.com", default, "1.00 KB → default limit"),
+        ("unchanged@example.com", unchanged, "already unlimited"),
+        ("missing@example.com", None, "no user found"),
+    ]
+    content = response.content.decode()
+    assert f'href="/admin/core/user/{duplicate.pk}/change/"' in content
+    assert "missing@example.com" in content
+    for user, expected in (
+        (unlimited, 0),
+        (duplicate, 0),
+        (limited, 500_000_000),
+        (default, None),
+        (unchanged, 0),
+        (untouched, 1000),
+    ):
+        user.refresh_from_db()
+        assert user.storage_limit_override == expected
+
+
+@override_settings(STORAGES=STATIC_STORAGES)
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"email\njohn.doe@example.com\n",
+        b"email,quota\njohn.doe@example.com,0\nnot-an-email,0\n",
+        b"email,quota\njohn.doe@example.com,-1\n",
+        b"email,quota\njohn.doe@example.com,abc\n",
+        b"email,quota\njohn.doe@example.com,0\njohn.doe@example.com,5\n",
+        b"email,quota\njohn.doe@example.com,0\n\xff\n",
+    ],
+)
+def test_admin_users_import_storage_limits_invalid_file(client, content):
+    """An invalid file should be rejected without updating any user."""
+    user = factories.UserFactory(email="john.doe@example.com", storage_limit_override=1000)
+
+    response = _import_storage_limits(_admin_client(client), content)
+
+    assert response.status_code == 200
+    assert list(response.context["form"].errors) == ["file"]
+    assert "results" not in response.context
+    user.refresh_from_db()
+    assert user.storage_limit_override == 1000
+
+
+def test_admin_users_import_storage_limits_without_change_permission(client):
+    """The import should be forbidden to staff users who cannot change users."""
+    user = factories.UserFactory(email="john.doe@example.com", storage_limit_override=1000)
+    client.force_login(factories.UserFactory(is_staff=True))
+
+    response = _import_storage_limits(client, b"email,quota\njohn.doe@example.com,0\n")
+
+    assert response.status_code == 403
+    user.refresh_from_db()
+    assert user.storage_limit_override == 1000
